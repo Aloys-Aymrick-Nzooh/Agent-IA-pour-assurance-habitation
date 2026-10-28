@@ -1,0 +1,21 @@
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: insurance_db
+    environment:
+      POSTGRES_DB: foyer_db
+      POSTGRES_USER: foyer
+      POSTGRES_PASSWORD: foyer1234
+    ports:
+      - "5434:5434"
+    volumes:
+      - foyer_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U foyer -d foyer_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  foyer_data:
