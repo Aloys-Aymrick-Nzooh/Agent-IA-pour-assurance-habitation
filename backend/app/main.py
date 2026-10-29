@@ -15,6 +15,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
     File,
+    Form
 )
 
 from sqlalchemy.orm import Session
@@ -89,7 +90,7 @@ def upload_document(
         "CP",
         "AVENANT",
         "ANNEXE",
-    ],
+    ]  = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -166,7 +167,8 @@ def upload_document(
             file_path,
             conversation_id=conversation_id,
             document_id=document_id,
-            document_name=document_type,
+            document_name=filename,
+            document_type=document_type
         )
 
         if len(extracted_pages) != page_count:
