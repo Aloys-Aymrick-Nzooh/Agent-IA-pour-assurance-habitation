@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: foyer
       POSTGRES_PASSWORD: foyer1234
     ports:
-      - "5434:5434"
+      - "5434:5432"
     volumes:
       - foyer_data:/var/lib/postgresql/data
     healthcheck:
