@@ -27,19 +27,19 @@ def load_document_pages(json_path: str | Path) -> list[dict[str, Any]]:
     if not isinstance(pages, list):
         raise ValueError("Document JSON must contain a pages list")
 
+    required_fields = {
+        "conversation_id",
+        "document_id",
+        "document_name",
+        "chapter",
+        "page_number",
+        "titles",
+        "page_content",
+    }
+
     for page in pages:
         if not isinstance(page, dict):
             raise ValueError("Each page must be a JSON object")
-
-        required_fields = {
-            "conversation_id",
-            "document_id",
-            "document_name",
-            "chapter",
-            "page_number",
-            "titles",
-            "page_content",
-        }
 
         if not required_fields.issubset(page):
             raise ValueError("A page is missing required metadata")
@@ -59,6 +59,7 @@ def load_document_pages(json_path: str | Path) -> list[dict[str, Any]]:
 def _split_long_text(text: str, max_chars: int) -> list[str]:
     """Split oversized text by sentences, then by character windows."""
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+
     parts: list[str] = []
     current = ""
 
@@ -71,7 +72,9 @@ def _split_long_text(text: str, max_chars: int) -> list[str]:
             else:
                 if current:
                     parts.append(current)
+
                 current = sentence
+
             continue
 
         if current:
@@ -80,8 +83,9 @@ def _split_long_text(text: str, max_chars: int) -> list[str]:
 
         # Last resort for a sentence longer than the chunk limit.
         start = 0
+
         while start < len(sentence):
-            parts.append(sentence[start:start + max_chars])
+            parts.append(sentence[start : start + max_chars])
             start += max_chars
 
     if current:
@@ -101,6 +105,7 @@ def _split_page_content(
     if not content:
         return []
 
+    # Markdown paragraphs are generally separated by one or more blank lines.
     paragraphs = [
         paragraph.strip()
         for paragraph in re.split(r"\n\s*\n", content)
@@ -130,6 +135,7 @@ def _split_page_content(
 
         # Preserve a small amount of context across chunk boundaries.
         overlap = ""
+
         if chunks and overlap_chars:
             overlap = chunks[-1][-overlap_chars:].strip()
 
@@ -141,7 +147,8 @@ def _split_page_content(
         if len(candidate) <= max_chars:
             current = candidate
         else:
-            # This can occur when the overlap and the next unit are large.
+            # The unit itself is already within max_chars.
+            # Drop the overlap rather than exceed the chunk limit.
             current = unit
 
     if current:
@@ -184,11 +191,19 @@ def chunk_document_pages(
             overlap_chars,
         )
 
+        # Keep compatibility with older JSON files that do not have
+        # document_type. New ingestion records provide this field.
+        document_type = page.get(
+            "document_type",
+            page["document_name"],
+        )
+
         for chunk_index, chunk_text in enumerate(page_chunks):
             chunks.append({
                 "conversation_id": page["conversation_id"],
                 "document_id": page["document_id"],
                 "document_name": page["document_name"],
+                "document_type": document_type,
                 "chapter": page["chapter"],
                 "page_number": page["page_number"],
                 "titles": list(page["titles"]),

@@ -1,7 +1,9 @@
 
+import json
 import os
 import uuid
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -11,16 +13,11 @@ from dotenv import load_dotenv
 
 from fastapi import (
     FastAPI,
-    Depends,
+    File,
+    Form,
     HTTPException,
     UploadFile,
-    File,
 )
-
-from sqlalchemy.orm import Session
-
-from app.database import get_db, init_db
-from app.models import Conversation, Document, DocumentPage
 
 from app.services.document_ingestion import (
     DocumentIngestionError,
@@ -28,18 +25,37 @@ from app.services.document_ingestion import (
     save_document_json,
 )
 
+from app.services.chunking import chunk_document_pages, load_document_pages
+from app.services.embeddings import EmbeddingService
+from app.services.vector_store import VectorStore, VectorStoreError
+
 load_dotenv()
 
 STORAGE_PATH = Path(
     os.getenv("STORAGE_PATH", "./storage")
 ).resolve()
 
+embedding_service = EmbeddingService()
+vector_store = VectorStore(STORAGE_PATH)
+
+CONVERSATIONS_PATH = STORAGE_PATH / "conversations"
+
 MAX_UPLOAD_SIZE = (
     int(os.getenv("MAX_UPLOAD_SIZE_MB", "30"))
-    * 1024 * 1024
+    * 1024
+    * 1024
 )
 
-STORAGE_PATH.mkdir(
+MAX_PDF_PAGES = 500
+
+DOCUMENT_TYPE_DIRS = {
+    "CG": "cg",
+    "CP": "cp",
+    "AVENANT": "avenant",
+    "ANNEXE": "annexe",
+}
+
+CONVERSATIONS_PATH.mkdir(
     parents=True,
     exist_ok=True,
 )
@@ -51,9 +67,70 @@ app = FastAPI(
 )
 
 
-@app.on_event("startup")
-def startup():
-    init_db()
+def _get_conversation_dir(
+    conversation_id: uuid.UUID,
+) -> Path:
+    """Return the directory of an existing conversation."""
+
+    conversation_dir = (
+        CONVERSATIONS_PATH / str(conversation_id)
+    )
+
+    metadata_path = conversation_dir / "conversation.json"
+
+    if not metadata_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found",
+        )
+
+    try:
+        metadata = json.loads(
+            metadata_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to read conversation metadata",
+        ) from exc
+
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("conversation_id") != str(conversation_id)
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Invalid conversation metadata",
+        )
+
+    return conversation_dir
+
+
+def _load_document_json(
+    json_path: Path,
+) -> dict:
+    """Read and validate a document JSON file."""
+
+    try:
+        payload = json.loads(
+            json_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to read document data",
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("pages"), list)
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Invalid document JSON structure",
+        )
+
+    return payload
 
 
 @app.get("/health")
@@ -65,20 +142,51 @@ def health():
 
 
 @app.post("/conversations")
-def create_conversation(
-    db: Session = Depends(get_db),
-):
-    conversation = Conversation()
+def create_conversation():
+    """Create a conversation isolated on the filesystem."""
 
-    db.add(conversation)
-    db.commit()
-    db.refresh(conversation)
+    conversation_id = uuid.uuid4()
+    created_at = datetime.now(timezone.utc)
 
-    return {
-        "conversation_id": str(conversation.id),
-        "created_at": conversation.created_at,
+    conversation_dir = (
+        CONVERSATIONS_PATH / str(conversation_id)
+    )
+
+    conversation_dir.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
+
+    metadata = {
+        "conversation_id": str(conversation_id),
+        "created_at": created_at.isoformat(),
     }
 
+    metadata_path = conversation_dir / "conversation.json"
+
+    try:
+        metadata_path.write_text(
+            json.dumps(
+                metadata,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        # Avoid leaving behind an incomplete conversation.
+        try:
+            metadata_path.unlink(missing_ok=True)
+            conversation_dir.rmdir()
+        except OSError:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create conversation",
+        ) from exc
+
+    return metadata
 
 
 @app.post("/conversations/{conversation_id}/documents")
@@ -89,17 +197,14 @@ def upload_document(
         "CP",
         "AVENANT",
         "ANNEXE",
-    ],
+    ] = Form(...),
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
 ):
-    conversation = db.get(Conversation, conversation_id)
+    """Store the original PDF and its extracted Markdown pages."""
 
-    if conversation is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Conversation not found",
-        )
+    conversation_dir = _get_conversation_dir(
+        conversation_id
+    )
 
     filename = Path(file.filename or "").name
 
@@ -109,7 +214,13 @@ def upload_document(
             detail="Only PDF files are supported",
         )
 
-    content = file.file.read(MAX_UPLOAD_SIZE + 1)
+    try:
+        content = file.file.read(MAX_UPLOAD_SIZE + 1)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read uploaded file",
+        ) from exc
 
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(
@@ -117,9 +228,12 @@ def upload_document(
             detail="File too large",
         )
 
-    # Valider le PDF avant de créer des fichiers ou des enregistrements.
+    # Validate the PDF before creating any document files.
     try:
-        with fitz.open(stream=content, filetype="pdf") as pdf:
+        with fitz.open(
+            stream=content,
+            filetype="pdf",
+        ) as pdf:
             if pdf.is_encrypted:
                 raise HTTPException(
                     status_code=400,
@@ -134,7 +248,7 @@ def upload_document(
                     detail="Empty PDF",
                 )
 
-            if page_count > 500:
+            if page_count > MAX_PDF_PAGES:
                 raise HTTPException(
                     status_code=400,
                     detail="PDF exceeds the page limit",
@@ -150,23 +264,31 @@ def upload_document(
 
     document_id = uuid.uuid4()
 
-    # Tous les fichiers restent isolés dans le dossier de la conversation.
-    conversation_dir = STORAGE_PATH / str(conversation_id)
-    conversation_dir.mkdir(parents=True, exist_ok=True)
+    type_dir = DOCUMENT_TYPE_DIRS[document_type]
 
-    file_path = conversation_dir / f"{document_id}.pdf"
-    json_path = conversation_dir / f"{document_id}.json"
+    document_dir = (
+        conversation_dir / "documents" / type_dir
+    )
+
+    document_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    pdf_path = document_dir / f"{document_id}.pdf"
+    json_path = document_dir / f"{document_id}.json"
 
     try:
-        # 1. Sauvegarder le PDF original.
-        file_path.write_bytes(content)
+        # 1. Preserve the original PDF.
+        pdf_path.write_bytes(content)
 
-        # 2. Extraire le contenu structuré page par page en Markdown.
+        # 2. Extract structured Markdown page by page.
         extracted_pages = extract_document_pages(
-            file_path,
+            pdf_path,
             conversation_id=conversation_id,
             document_id=document_id,
-            document_name=document_type,
+            document_name=filename,
+            document_type=document_type,
         )
 
         if len(extracted_pages) != page_count:
@@ -174,42 +296,32 @@ def upload_document(
                 "The extracted page count does not match the PDF"
             )
 
-        # 3. Persister le JSON de référence du document.
+        # 3. Save the authoritative page-level JSON.
         save_document_json(
             extracted_pages,
             json_path,
         )
 
-        # 4. Créer l'enregistrement du document.
-        document = Document(
-            id=document_id,
-            conversation_id=conversation_id,
-            filename=filename,
-            document_type=document_type,
-            file_path=str(file_path),
-            processing_status="completed",
-            page_count=page_count,
-        )
+        # 1. Recharger les pages depuis le JSON enregistré.
+        pages = load_document_pages(json_path)
 
-        db.add(document)
+        # 2. Découper les pages en chunks.
+        chunks = chunk_document_pages(pages)
 
-        # 5. Enregistrer chaque page Markdown dans PostgreSQL.
-        for page_data in extracted_pages:
-            db.add(
-                DocumentPage(
-                    conversation_id=conversation_id,
-                    document_id=document_id,
-                    page_number=page_data["page_number"],
-                    text=page_data["page_content"],
-                )
+        # 3. Calculer les embeddings des chunks.
+        embedded_chunks = embedding_service.embed_chunks(chunks)
+
+        # 4. Enregistrer les chunks et leurs vecteurs dans LanceDB.
+        stored_count = vector_store.upsert_chunks(embedded_chunks)
+
+        # 5. Vérifier que tous les chunks ont été indexés.
+        if stored_count != len(embedded_chunks):
+            raise VectorStoreError(
+                f"Indexation incomplète : {stored_count}/{len(embedded_chunks)} chunks enregistrés."
             )
 
-        # Valider tous les enregistrements dans une transaction.
-        db.commit()
-
     except DocumentIngestionError as exc:
-        db.rollback()
-        file_path.unlink(missing_ok=True)
+        pdf_path.unlink(missing_ok=True)
         json_path.unlink(missing_ok=True)
 
         raise HTTPException(
@@ -218,8 +330,7 @@ def upload_document(
         ) from exc
 
     except Exception as exc:
-        db.rollback()
-        file_path.unlink(missing_ok=True)
+        pdf_path.unlink(missing_ok=True)
         json_path.unlink(missing_ok=True)
 
         raise HTTPException(
@@ -237,32 +348,74 @@ def upload_document(
         "json_path": str(json_path),
     }
 
+
 @app.get("/conversations/{conversation_id}/documents")
 def get_documents(
     conversation_id: uuid.UUID,
-    db: Session = Depends(get_db),
 ):
-    conversation = db.get(
-        Conversation,
-        conversation_id,
+    """List all documents stored in a conversation."""
+
+    conversation_dir = _get_conversation_dir(
+        conversation_id
     )
 
-    if conversation is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Conversation not found",
-        )
+    documents_dir = conversation_dir / "documents"
+    documents = []
 
-    return [
-        {
-            "document_id": str(document.id),
-            "filename": document.filename,
-            "document_type": document.document_type,
-            "page_count": document.page_count,
-            "processing_status": document.processing_status,
-        }
-        for document in conversation.documents
-    ]
+    for document_type, type_dir in DOCUMENT_TYPE_DIRS.items():
+        type_path = documents_dir / type_dir
+
+        if not type_path.is_dir():
+            continue
+
+        for json_path in sorted(type_path.glob("*.json")):
+            payload = _load_document_json(json_path)
+            pages = payload["pages"]
+
+            if not pages:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Document JSON contains no pages",
+                )
+
+            first_page = pages[0]
+
+            if not isinstance(first_page, dict):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Invalid document page metadata",
+                )
+
+            try:
+                document_id = uuid.UUID(
+                    str(first_page["document_id"])
+                )
+            except (KeyError, ValueError, TypeError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Invalid document identifier",
+                ) from exc
+
+            if (
+                first_page.get("conversation_id")
+                != str(conversation_id)
+                or first_page.get("document_type")
+                != document_type
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Document metadata does not match its location",
+                )
+
+            documents.append({
+                "document_id": str(document_id),
+                "filename": first_page.get("document_name"),
+                "document_type": document_type,
+                "page_count": len(pages),
+                "processing_status": "completed",
+            })
+
+    return documents
 
 
 @app.get(
@@ -273,26 +426,66 @@ def get_document_page(
     conversation_id: uuid.UUID,
     document_id: uuid.UUID,
     page_number: int,
-    db: Session = Depends(get_db),
 ):
-    page = (
-        db.query(DocumentPage)
-        .filter(
-            DocumentPage.conversation_id == conversation_id,
-            DocumentPage.document_id == document_id,
-            DocumentPage.page_number == page_number,
-        )
-        .first()
+    """Retrieve the original Markdown content of one page."""
+
+    conversation_dir = _get_conversation_dir(
+        conversation_id
     )
 
-    if page is None:
+    if page_number < 1:
         raise HTTPException(
             status_code=404,
             detail="Page not found",
         )
 
-    return {
-        "document_id": str(document_id),
-        "page_number": page.page_number,
-        "text": page.text,
-    }
+    documents_dir = conversation_dir / "documents"
+
+    # Search all supported document types. This avoids requiring
+    # the caller to know the document's type.
+    for type_dir in DOCUMENT_TYPE_DIRS.values():
+        json_path = (
+            documents_dir
+            / type_dir
+            / f"{document_id}.json"
+        )
+
+        if not json_path.is_file():
+            continue
+
+        payload = _load_document_json(json_path)
+
+        for page in payload["pages"]:
+            if not isinstance(page, dict):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Invalid document page structure",
+                )
+
+            if (
+                page.get("conversation_id")
+                != str(conversation_id)
+                or page.get("document_id")
+                != str(document_id)
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Document page metadata does not match its source",
+                )
+
+            if page.get("page_number") == page_number:
+                return {
+                    "document_id": str(document_id),
+                    "page_number": page_number,
+                    "text": page.get("page_content", ""),
+                }
+
+        raise HTTPException(
+            status_code=404,
+            detail="Page not found",
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail="Document not found",
+    )

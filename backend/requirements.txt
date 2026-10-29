@@ -7,3 +7,6 @@ pgvector
 pymupdf
 python-multipart
 python-dotenv
+sentence-transformers
+pymupdf4llm
+lancedb
