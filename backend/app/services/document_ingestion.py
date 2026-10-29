@@ -63,13 +63,17 @@ def extract_document_pages(
     conversation_id: uuid.UUID | str,
     document_id: uuid.UUID | str,
     document_name: str,
+    document_type: str,
 ) -> list[dict[str, Any]]:
     """
     Extract a PDF into page-level Markdown records.
 
-    Each record keeps the document and conversation identifiers so that
-    later retrieval and cache operations can enforce conversation scope.
+    Each record preserves the original page content and its metadata,
+    including the document type and conversation/document identifiers.
     """
+    if not isinstance(document_type, str) or not document_type.strip():
+        raise DocumentIngestionError("Document type must not be empty")
+
     path = Path(pdf_path)
 
     if not path.is_file():
@@ -110,6 +114,7 @@ def extract_document_pages(
             "conversation_id": str(conversation_id),
             "document_id": str(document_id),
             "document_name": document_name,
+            "document_type": document_type.strip(),
             "chapter": _extract_chapter(titles),
             "page_number": index,
             "titles": titles,
