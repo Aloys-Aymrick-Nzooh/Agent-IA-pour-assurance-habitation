@@ -22,6 +22,11 @@ from sqlalchemy.orm import Session
 from app.database import get_db, init_db
 from app.models import Conversation, Document, DocumentPage
 
+from app.services.document_ingestion import (
+    DocumentIngestionError,
+    extract_document_pages,
+    save_document_json,
+)
 
 load_dotenv()
 
@@ -75,27 +80,20 @@ def create_conversation(
     }
 
 
+
 @app.post("/conversations/{conversation_id}/documents")
 def upload_document(
     conversation_id: uuid.UUID,
-
     document_type: Literal[
         "CG",
         "CP",
         "AVENANT",
         "ANNEXE",
     ],
-
     file: UploadFile = File(...),
-
     db: Session = Depends(get_db),
 ):
-    # 1. Vérifier que la conversation existe
-
-    conversation = db.get(
-        Conversation,
-        conversation_id,
-    )
+    conversation = db.get(Conversation, conversation_id)
 
     if conversation is None:
         raise HTTPException(
@@ -103,23 +101,15 @@ def upload_document(
             detail="Conversation not found",
         )
 
-    # 2. Vérifier le nom et le format du fichier
+    filename = Path(file.filename or "").name
 
-    filename = Path(
-        file.filename or ""
-    ).name
-
-    if not filename.lower().endswith(".pdf"):
+    if not filename or not filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
             detail="Only PDF files are supported",
         )
 
-    # 3. Lire le fichier avec une limite de taille
-
-    content = file.file.read(
-        MAX_UPLOAD_SIZE + 1
-    )
+    content = file.file.read(MAX_UPLOAD_SIZE + 1)
 
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(
@@ -127,115 +117,125 @@ def upload_document(
             detail="File too large",
         )
 
-    # 4. Générer un identifiant de document
-
-    document_id = uuid.uuid4()
-
-    # 5. Stocker le fichier dans le dossier
-    # correspondant à la conversation
-
-    conversation_dir = (
-        STORAGE_PATH / str(conversation_id)
-    )
-
-    conversation_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    file_path = (
-        conversation_dir
-        / f"{document_id}.pdf"
-    )
-
-    # 6. Extraire le texte des pages du PDF
-
+    # Valider le PDF avant de créer des fichiers ou des enregistrements.
     try:
-        pdf = fitz.open(
-            stream=content,
-            filetype="pdf",
-        )
+        with fitz.open(stream=content, filetype="pdf") as pdf:
+            if pdf.is_encrypted:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Encrypted PDFs are not supported",
+                )
 
-        if pdf.is_encrypted:
-            raise HTTPException(
-                status_code=400,
-                detail="Encrypted PDFs are not supported",
-            )
+            page_count = len(pdf)
 
-        if len(pdf) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Empty PDF",
-            )
+            if page_count == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Empty PDF",
+                )
 
-        if len(pdf) > 500:
-            raise HTTPException(
-                status_code=400,
-                detail="PDF exceeds the page limit",
-            )
-
-        extracted_pages = []
-
-        for page_index, page in enumerate(pdf):
-            page_text = page.get_text("text").strip()
-
-            extracted_pages.append({
-                "page_number": page_index + 1,
-                "text": page_text,
-            })
-
-        pdf.close()
+            if page_count > 500:
+                raise HTTPException(
+                    status_code=400,
+                    detail="PDF exceeds the page limit",
+                )
 
     except HTTPException:
         raise
-
-    except Exception:
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail="Unable to read the PDF",
-        )
+        ) from exc
 
-    # 7. Enregistrer le fichier original
+    document_id = uuid.uuid4()
 
-    file_path.write_bytes(content)
+    # Tous les fichiers restent isolés dans le dossier de la conversation.
+    conversation_dir = STORAGE_PATH / str(conversation_id)
+    conversation_dir.mkdir(parents=True, exist_ok=True)
 
-    # 8. Créer le document dans la base
+    file_path = conversation_dir / f"{document_id}.pdf"
+    json_path = conversation_dir / f"{document_id}.json"
 
-    document = Document(
-        id=document_id,
-        conversation_id=conversation_id,
-        filename=filename,
-        document_type=document_type,
-        file_path=str(file_path),
-        processing_status="completed",
-        page_count=len(extracted_pages),
-    )
+    try:
+        # 1. Sauvegarder le PDF original.
+        file_path.write_bytes(content)
 
-    db.add(document)
-
-    # 9. Enregistrer le texte extrait page par page
-
-    for page_data in extracted_pages:
-        page = DocumentPage(
+        # 2. Extraire le contenu structuré page par page en Markdown.
+        extracted_pages = extract_document_pages(
+            file_path,
             conversation_id=conversation_id,
             document_id=document_id,
-            page_number=page_data["page_number"],
-            text=page_data["text"],
+            document_name=document_type,
         )
 
-        db.add(page)
+        if len(extracted_pages) != page_count:
+            raise DocumentIngestionError(
+                "The extracted page count does not match the PDF"
+            )
 
-    db.commit()
+        # 3. Persister le JSON de référence du document.
+        save_document_json(
+            extracted_pages,
+            json_path,
+        )
+
+        # 4. Créer l'enregistrement du document.
+        document = Document(
+            id=document_id,
+            conversation_id=conversation_id,
+            filename=filename,
+            document_type=document_type,
+            file_path=str(file_path),
+            processing_status="completed",
+            page_count=page_count,
+        )
+
+        db.add(document)
+
+        # 5. Enregistrer chaque page Markdown dans PostgreSQL.
+        for page_data in extracted_pages:
+            db.add(
+                DocumentPage(
+                    conversation_id=conversation_id,
+                    document_id=document_id,
+                    page_number=page_data["page_number"],
+                    text=page_data["page_content"],
+                )
+            )
+
+        # Valider tous les enregistrements dans une transaction.
+        db.commit()
+
+    except DocumentIngestionError as exc:
+        db.rollback()
+        file_path.unlink(missing_ok=True)
+        json_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        db.rollback()
+        file_path.unlink(missing_ok=True)
+        json_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to process and store the document",
+        ) from exc
 
     return {
         "conversation_id": str(conversation_id),
         "document_id": str(document_id),
         "filename": filename,
         "document_type": document_type,
-        "page_count": len(extracted_pages),
+        "page_count": page_count,
         "processing_status": "completed",
+        "json_path": str(json_path),
     }
-
 
 @app.get("/conversations/{conversation_id}/documents")
 def get_documents(
