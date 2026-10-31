@@ -1,14 +1,23 @@
-
+import os
+from functools import lru_cache
 from typing import Any, Sequence
 
 import numpy as np
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
+# Les constantes ci-dessous sont lues à l'import : le .env doit déjà être chargé.
+load_dotenv()
 
-DEFAULT_MODEL_NAME = (
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-)
-EMBEDDING_DIMENSION = 384
+
+# bge-m3 : multilingue, contexte long, 1024 dimensions, sans préfixe.
+# Alternative plus légère : intfloat/multilingual-e5-base (768 dimensions,
+# préfixes "query: " / "passage: " gérés automatiquement ci-dessous).
+# Changer de modèle impose de supprimer les index LanceDB existants et de
+# réindexer les documents : les dimensions ne sont pas compatibles.
+DEFAULT_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
+MAX_SEQ_LENGTH = 512
 
 
 def build_embedding_text(chunk: dict[str, Any]) -> str:
@@ -49,7 +58,7 @@ class EmbeddingService:
         self,
         model_name: str = DEFAULT_MODEL_NAME,
         *,
-        batch_size: int = 32,
+        batch_size: int = 16,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size doit être supérieur ou égal à 1.")
@@ -58,23 +67,35 @@ class EmbeddingService:
         self.batch_size = batch_size
         self._model: SentenceTransformer | None = None
 
+        # Les modèles E5 exigent des préfixes ; bge-m3 n'en veut pas.
+        if "e5" in model_name.lower():
+            self.query_prefix, self.passage_prefix = "query: ", "passage: "
+        else:
+            self.query_prefix = self.passage_prefix = ""
+
     @property
     def model(self) -> SentenceTransformer:
         # Chargement paresseux : le modèle n'est chargé qu'à la première
         # demande d'embedding, puis réutilisé.
         if self._model is None:
-            self._model = SentenceTransformer(self.model_name)
+            model = SentenceTransformer(self.model_name)
+            # Plafonne la longueur : 512 tokens couvrent un chunk de 1800 caractères.
+            model.max_seq_length = min(model.max_seq_length or MAX_SEQ_LENGTH, MAX_SEQ_LENGTH)
+            self._model = model
         return self._model
 
-    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_texts(
+        self, texts: Sequence[str], *, is_query: bool = False
+    ) -> list[list[float]]:
         if not texts:
             return []
 
         if any(not isinstance(text, str) or not text.strip() for text in texts):
             raise ValueError("Tous les textes à vectoriser doivent être non vides.")
 
+        prefix = self.query_prefix if is_query else self.passage_prefix
         embeddings = self.model.encode(
-            list(texts),
+            [prefix + text for text in texts],
             batch_size=self.batch_size,
             convert_to_numpy=True,
             normalize_embeddings=True,
@@ -87,13 +108,16 @@ class EmbeddingService:
         if embeddings.shape != expected_shape:
             raise ValueError(
                 f"Dimensions d'embeddings invalides : {embeddings.shape}; "
-                f"attendu : {expected_shape}."
+                f"attendu : {expected_shape}. Vérifie EMBEDDING_DIMENSION."
             )
 
         if not np.isfinite(embeddings).all():
             raise ValueError("Les embeddings contiennent des valeurs non finies.")
 
         return embeddings.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_texts([text], is_query=True)[0]
 
     def embed_chunks(
         self, chunks: Sequence[dict[str, Any]]
@@ -103,9 +127,7 @@ class EmbeddingService:
 
         # L'embedding représente le type de document, le chapitre,
         # les titres de page et le texte du chunk.
-        embedding_texts = [
-            build_embedding_text(chunk) for chunk in chunks
-        ]
+        embedding_texts = [build_embedding_text(chunk) for chunk in chunks]
 
         embeddings = self.embed_texts(embedding_texts)
 
@@ -120,3 +142,9 @@ class EmbeddingService:
                 chunks, embedding_texts, embeddings
             )
         ]
+
+
+@lru_cache(maxsize=1)
+def get_embedding_service() -> EmbeddingService:
+    """Instance unique partagée (ingestion + agent) : un seul modèle en mémoire."""
+    return EmbeddingService()

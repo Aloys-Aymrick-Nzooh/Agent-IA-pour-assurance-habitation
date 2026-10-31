@@ -10,3 +10,9 @@ python-dotenv
 sentence-transformers
 pymupdf4llm
 lancedb
+langgraph
+langchain-core
+langchain-openai
+langchain-anthropic
+langchain-google-genai
+rank-bm25

@@ -1,5 +1,5 @@
-
 import json
+import logging
 import os
 import uuid
 
@@ -11,34 +11,41 @@ import fitz
 
 from dotenv import load_dotenv
 
-from fastapi import (
+# Doit s'exécuter AVANT les imports applicatifs : embeddings.py lit
+# EMBEDDING_MODEL / EMBEDDING_DIMENSION au moment de l'import.
+load_dotenv()
+
+from fastapi import (  # noqa: E402
     FastAPI,
     File,
     Form,
     HTTPException,
     UploadFile,
 )
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
-from app.services.document_ingestion import (
+from app.services.ai_agent_service.config import (  # noqa: E402
+    CONVERSATIONS_PATH,
+    DOCUMENT_TYPE_DIRS,
+    STORAGE_PATH,
+)
+
+from app.services.data_base_service.document_ingestion import (  # noqa: E402
     DocumentIngestionError,
     extract_document_pages,
     save_document_json,
 )
 
-from app.services.chunking import chunk_document_pages, load_document_pages
-from app.services.embeddings import EmbeddingService
-from app.services.vector_store import VectorStore, VectorStoreError
+from app.services.data_base_service.chunking import chunk_document_pages, load_document_pages  # noqa: E402
+from app.services.data_base_service.embeddings import get_embedding_service  # noqa: E402
+from app.services.data_base_service.vector_store import VectorStore, VectorStoreError  # noqa: E402
+from app.agent import router as agent_router  # noqa: E402
 
-load_dotenv()
+logger = logging.getLogger("uvicorn.error")
 
-STORAGE_PATH = Path(
-    os.getenv("STORAGE_PATH", "./storage")
-).resolve()
-
-embedding_service = EmbeddingService()
+# Instance unique du modèle d'embedding, partagée avec l'agent.
+embedding_service = get_embedding_service()
 vector_store = VectorStore(STORAGE_PATH)
-
-CONVERSATIONS_PATH = STORAGE_PATH / "conversations"
 
 MAX_UPLOAD_SIZE = (
     int(os.getenv("MAX_UPLOAD_SIZE_MB", "30"))
@@ -48,12 +55,14 @@ MAX_UPLOAD_SIZE = (
 
 MAX_PDF_PAGES = 500
 
-DOCUMENT_TYPE_DIRS = {
-    "CG": "cg",
-    "CP": "cp",
-    "AVENANT": "avenant",
-    "ANNEXE": "annexe",
-}
+# Origines autorisées à appeler l'API depuis un navigateur (séparées par des virgules).
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"
+    ).split(",")
+    if origin.strip()
+]
 
 CONVERSATIONS_PATH.mkdir(
     parents=True,
@@ -65,6 +74,17 @@ app = FastAPI(
     description="Contractual document analysis API",
     version="0.1.0",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    # Inclut X-LLM-Provider, X-LLM-Model et X-LLM-Api-Key.
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
+app.include_router(agent_router)
 
 
 def _get_conversation_dir(
@@ -131,6 +151,29 @@ def _load_document_json(
         )
 
     return payload
+
+
+def _cleanup_failed_upload(
+    conversation_id: uuid.UUID,
+    document_type: str,
+    document_id: uuid.UUID,
+    pdf_path: Path,
+    json_path: Path,
+) -> None:
+    """Supprime tout ce qu'un upload raté a pu laisser : fichiers ET vecteurs."""
+
+    pdf_path.unlink(missing_ok=True)
+    json_path.unlink(missing_ok=True)
+
+    # Sans ça, le RAG pourrait retrouver des chunks dont le document n'existe plus.
+    try:
+        vector_store.delete_document(
+            str(conversation_id),
+            document_type,
+            str(document_id),
+        )
+    except Exception:
+        logger.exception("Vector cleanup failed for document %s", document_id)
 
 
 @app.get("/health")
@@ -302,27 +345,29 @@ def upload_document(
             json_path,
         )
 
-        # 1. Recharger les pages depuis le JSON enregistré.
+        # 4. Recharger les pages depuis le JSON enregistré.
         pages = load_document_pages(json_path)
 
-        # 2. Découper les pages en chunks.
+        # 5. Découper les pages en chunks.
         chunks = chunk_document_pages(pages)
 
-        # 3. Calculer les embeddings des chunks.
+        # 6. Calculer les embeddings des chunks.
         embedded_chunks = embedding_service.embed_chunks(chunks)
 
-        # 4. Enregistrer les chunks et leurs vecteurs dans LanceDB.
+        # 7. Enregistrer les chunks et leurs vecteurs dans LanceDB.
         stored_count = vector_store.upsert_chunks(embedded_chunks)
 
-        # 5. Vérifier que tous les chunks ont été indexés.
+        # 8. Vérifier que tous les chunks ont été indexés.
         if stored_count != len(embedded_chunks):
             raise VectorStoreError(
                 f"Indexation incomplète : {stored_count}/{len(embedded_chunks)} chunks enregistrés."
             )
 
     except DocumentIngestionError as exc:
-        pdf_path.unlink(missing_ok=True)
-        json_path.unlink(missing_ok=True)
+        logger.warning("Ingestion failed for document %s: %s", document_id, exc)
+        _cleanup_failed_upload(
+            conversation_id, document_type, document_id, pdf_path, json_path
+        )
 
         raise HTTPException(
             status_code=422,
@@ -330,8 +375,10 @@ def upload_document(
         ) from exc
 
     except Exception as exc:
-        pdf_path.unlink(missing_ok=True)
-        json_path.unlink(missing_ok=True)
+        logger.exception("Document processing failed for document %s", document_id)
+        _cleanup_failed_upload(
+            conversation_id, document_type, document_id, pdf_path, json_path
+        )
 
         raise HTTPException(
             status_code=500,
