@@ -1,9 +1,12 @@
-
+import math
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
 import lancedb
+
+from app.services.data_base_service.embeddings import EMBEDDING_DIMENSION
 
 
 DOCUMENT_TYPE_DIRS = {
@@ -30,9 +33,7 @@ class VectorStore:
         document_type: str,
     ) -> Path:
         try:
-            conversation_id = str(
-                __import__("uuid").UUID(str(conversation_id))
-            )
+            conversation_id = str(uuid.UUID(str(conversation_id)))
         except (ValueError, TypeError, AttributeError) as exc:
             raise ValueError("Invalid conversation ID") from exc
 
@@ -48,6 +49,33 @@ class VectorStore:
             / "lancedb"
             / type_dir
         )
+
+    def open_table(self, conversation_id: str, document_type: str):
+        """Retourne la table LanceDB du couple (conversation, type), ou None."""
+        path = self._get_database_path(conversation_id, document_type)
+
+        # lancedb.connect() crée le dossier s'il n'existe pas : on teste avant.
+        if not path.is_dir():
+            return None
+
+        try:
+            return lancedb.connect(str(path)).open_table(TABLE_NAME)
+        except Exception:
+            return None
+
+    def delete_document(
+        self,
+        conversation_id: str,
+        document_type: str,
+        document_id: str,
+    ) -> None:
+        """Supprime les vecteurs d'un document (nettoyage après un échec)."""
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", str(document_id)):
+            raise ValueError("Invalid document ID")
+
+        table = self.open_table(conversation_id, document_type)
+        if table is not None:
+            table.delete(f"document_id = '{document_id}'")
 
     def upsert_chunks(
         self,
@@ -105,18 +133,15 @@ class VectorStore:
 
             if (
                 not isinstance(embedding, list)
-                or len(embedding) != 384
+                or len(embedding) != EMBEDDING_DIMENSION
                 or any(
-                    not isinstance(value, (int, float))
-                    or not __import__("math").isfinite(value)
+                    not isinstance(value, (int, float)) or not math.isfinite(value)
                     for value in embedding
                 )
             ):
                 raise ValueError("Invalid embedding vector")
 
-            chunk_id = (
-                f"{document_id}:{page_number}:{chunk_index}"
-            )
+            chunk_id = f"{document_id}:{page_number}:{chunk_index}"
 
             rows.append({
                 "chunk_id": chunk_id,
@@ -126,13 +151,12 @@ class VectorStore:
                 "document_type": document_type,
                 "chapter": chunk.get("chapter") or "",
                 "page_number": page_number,
-                "titles": chunk.get("titles", []),
+                # Chaîne et non liste : une liste vide partout fait inférer
+                # list<null> à PyArrow et casse l'écriture LanceDB.
+                "titles": " > ".join(chunk.get("titles") or []),
                 "chunk_index": chunk_index,
                 "chunk_text": chunk_text,
-                "embedding_text": chunk.get(
-                    "embedding_text",
-                    chunk_text,
-                ),
+                "embedding_text": chunk.get("embedding_text", chunk_text),
                 "vector": embedding,
             })
 
@@ -154,17 +178,13 @@ class VectorStore:
 
                 # Remove previous vectors for these documents so
                 # re-ingestion does not leave obsolete chunks behind.
-                document_ids = sorted({
-                    row["document_id"] for row in rows
-                })
+                document_ids = sorted({row["document_id"] for row in rows})
 
                 for document_id in document_ids:
                     if not re.fullmatch(r"[0-9a-fA-F-]{36}", document_id):
                         raise ValueError("Invalid document ID")
 
-                    table.delete(
-                        f"document_id = '{document_id}'"
-                    )
+                    table.delete(f"document_id = '{document_id}'")
 
                 table.add(rows)
             else:
