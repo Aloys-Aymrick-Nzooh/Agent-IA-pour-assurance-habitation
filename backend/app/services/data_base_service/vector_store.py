@@ -1,3 +1,4 @@
+import json
 import math
 import re
 import uuid
@@ -62,6 +63,90 @@ class VectorStore:
             return lancedb.connect(str(path)).open_table(TABLE_NAME)
         except Exception:
             return None
+
+    def available_document_types(
+        self,
+        conversation_id: str,
+    ) -> list[str]:
+        """Return document types with a non-empty LanceDB table."""
+        return [
+            document_type
+            for document_type in DOCUMENT_TYPE_DIRS
+            if (table := self.open_table(conversation_id, document_type))
+            is not None
+            and table.count_rows() > 0
+        ]
+
+    def get_pages(
+        self,
+        conversation_id: str,
+        refs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Load complete source pages for unique document/page references."""
+        try:
+            conversation_id = str(uuid.UUID(str(conversation_id)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("Invalid conversation ID") from exc
+
+        selected: dict[tuple[str, str, int], None] = {}
+        for ref in refs:
+            document_type = ref.get("document_type")
+            page_number = ref.get("page_number")
+            try:
+                document_id = str(uuid.UUID(str(ref.get("document_id"))))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError("Invalid document ID") from exc
+
+            if document_type not in DOCUMENT_TYPE_DIRS:
+                raise ValueError("Unsupported document type")
+            if not isinstance(page_number, int) or page_number < 1:
+                raise ValueError("Invalid page number")
+
+            selected[(document_id, document_type, page_number)] = None
+
+        grouped: dict[tuple[str, str], set[int]] = {}
+        for document_id, document_type, page_number in selected:
+            grouped.setdefault((document_id, document_type), set()).add(page_number)
+
+        found: dict[tuple[str, str, int], dict[str, Any]] = {}
+        for (document_id, document_type), page_numbers in grouped.items():
+            type_dir = DOCUMENT_TYPE_DIRS[document_type]
+            json_path = (
+                self.storage_path
+                / "conversations"
+                / conversation_id
+                / "documents"
+                / type_dir
+                / f"{document_id}.json"
+            )
+            if not json_path.is_file():
+                continue
+
+            try:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise VectorStoreError("Unable to read source pages") from exc
+
+            pages = payload.get("pages") if isinstance(payload, dict) else None
+            if not isinstance(pages, list):
+                raise VectorStoreError("Invalid source pages structure")
+
+            for page in pages:
+                if not isinstance(page, dict):
+                    raise VectorStoreError("Invalid source page structure")
+                if (
+                    page.get("conversation_id") != conversation_id
+                    or page.get("document_id") != document_id
+                ):
+                    raise VectorStoreError("Source page metadata mismatch")
+
+                page_number = page.get("page_number")
+                if page_number in page_numbers:
+                    if not isinstance(page.get("page_content"), str):
+                        raise VectorStoreError("Invalid source page content")
+                    found[(document_id, document_type, page_number)] = page
+
+        return [found[key] for key in selected if key in found]
 
     def delete_document(
         self,
