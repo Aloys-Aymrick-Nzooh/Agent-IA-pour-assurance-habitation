@@ -308,11 +308,13 @@ def _trace_state_snapshot(
         "needs_clarification",
         "clarification_question",
         "general_answer_reason",
-        "doc_types",
-        "search_query",
+        "available_doc_types",
+        "search_axes",
         "context_resolution_reason",
         "retrieval_plan_reason",
         "retrieval_attempts",
+        "retrieval_iteration",
+        "executed_queries",
         "retrieval_results",
         "retrieved_pages",
         "search_trace",
@@ -322,6 +324,11 @@ def _trace_state_snapshot(
         "evidence_decision",
         "evidence_evaluation_reason",
         "evidence_sufficient",
+        "follow_up_queries",
+        "supporting_pages",
+        "axis_assessments",
+        "contradictions",
+        "limitations",
         "answer",
         "citations",
         "citations_validated",
@@ -362,7 +369,7 @@ def _get_routing_decision(
         return "resolve_context"
 
     if node_name == "plan_retrieval":
-        return "retrieve" if state.get("doc_types") else "abstain"
+        return "retrieve" if state.get("search_axes") else "abstain"
 
     if node_name == "resolve_context":
         if state.get("needs_clarification"):
@@ -413,17 +420,22 @@ def _progress_detail(
         return "Question contextualisée pour la recherche."
 
     if node_name == "plan_retrieval":
-        types = ", ".join(state.get("doc_types", [])) or "aucun type"
-        return f"Documents ciblés : {types}. {_short_progress_text(output.get('retrieval_plan_reason', ''))}"
+        axes = state.get("search_axes", [])
+        by_type: dict[str, int] = {}
+        for axis in axes:
+            document_type = axis.get("document_type", "?")
+            by_type[document_type] = by_type.get(document_type, 0) + 1
+        summary = ", ".join(f"{doc_type} : {count} axe(s)" for doc_type, count in by_type.items())
+        return f"Axes planifiés ({len(axes)}) : {summary or 'aucun'}. {_short_progress_text(output.get('retrieval_plan_reason', ''))}"
 
     if node_name == "retrieve":
         count = len(output.get("retrieval_results", []))
-        return f"{count} passage(s) retrouvé(s) dans les documents indexés."
+        axes = len(state.get("search_axes", []))
+        return f"{count} chunk(s) retrouvé(s) sur {axes} axe(s) de recherche."
 
     if node_name == "build_evidence":
         pages = output.get("retrieved_pages", [])
-        passage_count = sum(len(page.get("passages", [])) for page in pages)
-        return f"Preuves assemblées : {passage_count} passage(s) sur {len(pages)} page(s)."
+        return f"Preuves assemblées : {len(pages)} page(s) complète(s) dédupliquée(s)."
 
     if node_name == "evaluate":
         decisions = {
@@ -685,6 +697,26 @@ def _build_llm(
         ) from exc
 
 
+def _extract_llm_auth_error(exc: Exception) -> str | None:
+    """Map provider auth failures to a clear user-facing message."""
+    text = str(exc).lower()
+    indicators = (
+        "api key",
+        "authentication",
+        "auth",
+        "expired",
+        "401",
+        "invalid api",
+        "unauthorized",
+    )
+    if any(indicator in text for indicator in indicators):
+        return (
+            "The selected LLM API key is invalid or expired. "
+            "Please add a new valid key in the app settings."
+        )
+    return None
+
+
 def _build_retriever(request: Request) -> HybridRetriever:
     """Build the hybrid retriever using shared application services."""
 
@@ -712,10 +744,16 @@ def _initial_state(
         "conversation_history": conversation_history,
         "available_documents": available_documents,
         "retrieval_attempts": 0,
+        "retrieval_iteration": 0,
+        "executed_queries": [],
         "retrieval_results": [],
         "retrieved_pages": [],
         "search_trace": [],
         "missing_information": [],
+        "follow_up_queries": [],
+        "supporting_pages": [],
+        "axis_assessments": [],
+        "contradictions": [],
         "citations": [],
         "limitations": [],
         "answer": "",
@@ -851,15 +889,22 @@ def post_message(
                 conversation_id_str,
             )
 
+            auth_error = _extract_llm_auth_error(exc)
+            if auth_error:
+                raise HTTPException(
+                    status_code=401,
+                    detail=auth_error,
+                ) from exc
+
             # On conserve la clarification en attente si le graphe échoue.
             raise HTTPException(
                 status_code=500,
                 detail="Unable to process the message",
             ) from exc
 
-        answer = str(result.get("answer", "")).strip()
+        answer = result.get("answer", "")
 
-        if not answer:
+        if not isinstance(answer, str) or not answer.strip():
             raise HTTPException(
                 status_code=500,
                 detail="The agent returned an empty answer",
