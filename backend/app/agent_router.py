@@ -16,17 +16,17 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.services.ai_agent_service.graph import build_agent_graph
-from app.services.ai_agent_service.retrieval_algorithm import (
+from .services.ai_agent_service.graph import build_agent_graph
+from .services.ai_agent_service.retrieval_algorithm import (
     HybridRetriever,
     Reranker,
 )
-from app.services.ai_agent_service.llm import LLM, LLMConfig
-from app.services.ai_agent_service.config import (
+from .services.ai_agent_service.llm import LLM, LLMConfig
+from .services.ai_agent_service.config import (
     CONVERSATIONS_PATH,
     DOCUMENT_TYPE_DIRS,
 )
-from app.services.data_base_service.vector_store import VectorStore
+from .services.data_base_service.vector_store import VectorStore
 
 
 logger = logging.getLogger("uvicorn.error")

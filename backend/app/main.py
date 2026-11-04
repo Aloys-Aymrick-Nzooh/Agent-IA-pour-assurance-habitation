@@ -37,10 +37,10 @@ from app.services.data_base_service.document_ingestion import (  # noqa: E402
     save_document_json,
 )
 
-from app.services.data_base_service.chunking import chunk_document_pages, load_document_pages  # noqa: E402
-from app.services.data_base_service.embeddings import get_embedding_service  # noqa: E402
-from app.services.data_base_service.vector_store import VectorStore, VectorStoreError  # noqa: E402
-from app.agent_router import router as agent_router  # noqa: E402
+from .services.data_base_service.chunking import chunk_document_pages, load_document_pages  # noqa: E402
+from .services.data_base_service.embeddings import get_embedding_service  # noqa: E402
+from .services.data_base_service.vector_store import VectorStore, VectorStoreError  # noqa: E402
+from .agent_router import router as agent_router  # noqa: E402
 
 logger = logging.getLogger("uvicorn.error")
 
