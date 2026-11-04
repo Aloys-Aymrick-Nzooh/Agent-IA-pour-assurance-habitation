@@ -51,10 +51,12 @@ def validate_citations(
                 "document_type": page.get("document_type"),
                 "page_number": page.get("page_number"),
                 "chunk_id": chunk_id,
+                "excerpt": passage.get("text", ""),
             }
 
     validated = []
-    seen = set()
+    seen_chunks = set()
+    seen_pages = set()
 
     for citation in citations:
 
@@ -85,10 +87,19 @@ def validate_citations(
                     f"Référence incorrecte pour {chunk_id} : {field}"
                 )
 
-        # Évite les citations identiques répétées.
-        if chunk_id not in seen:
-            validated.append(expected)
-            seen.add(chunk_id)
+        page_key = (
+            expected["document_id"],
+            expected["document_type"],
+            expected["page_number"],
+        )
+
+        # Évite les citations identiques répétées et les doublons de page.
+        if chunk_id in seen_chunks or page_key in seen_pages:
+            continue
+
+        validated.append(expected)
+        seen_chunks.add(chunk_id)
+        seen_pages.add(page_key)
 
     return {
         "citations": validated,
