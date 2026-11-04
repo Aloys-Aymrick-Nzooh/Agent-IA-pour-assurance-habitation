@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import shutil
 import uuid
 
 from datetime import datetime, timezone
@@ -39,7 +40,7 @@ from app.services.data_base_service.document_ingestion import (  # noqa: E402
 from app.services.data_base_service.chunking import chunk_document_pages, load_document_pages  # noqa: E402
 from app.services.data_base_service.embeddings import get_embedding_service  # noqa: E402
 from app.services.data_base_service.vector_store import VectorStore, VectorStoreError  # noqa: E402
-from app.agent import router as agent_router  # noqa: E402
+from app.agent_router import router as agent_router  # noqa: E402
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -74,6 +75,9 @@ app = FastAPI(
     description="Contractual document analysis API",
     version="0.1.0",
 )
+
+app.state.vector_store = vector_store
+app.state.embedding_service = embedding_service
 
 app.add_middleware(
     CORSMiddleware,
@@ -536,3 +540,23 @@ def get_document_page(
         status_code=404,
         detail="Document not found",
     )
+
+
+@app.delete("/conversations/{conversation_id}")
+def delete_conversation(conversation_id: uuid.UUID):
+    """Delete a conversation, including its uploaded documents and vector indexes."""
+    conversation_dir = _get_conversation_dir(conversation_id)
+
+    try:
+        shutil.rmtree(conversation_dir)
+    except OSError as exc:
+        logger.exception("Unable to delete conversation %s", conversation_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to delete conversation",
+        ) from exc
+
+    return {
+        "conversation_id": str(conversation_id),
+        "status": "deleted",
+    }

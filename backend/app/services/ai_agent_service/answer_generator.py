@@ -60,13 +60,23 @@ RÈGLES OBLIGATOIRES :
 
 8. Utilise un langage simple, précis et pédagogique.
 
+FORMAT DE SORTIE :
+- Rédige answer en Markdown GitHub (GFM) valide : titres, listes,
+  tableaux ou emphase uniquement quand cela améliore la lisibilité.
+- N'inclus aucun HTML et n'entoure pas la réponse d'un bloc de code.
+- Préserve les marqueurs de citation [[cite:<chunk_id>]] en fin de phrase.
+
 CITATIONS :
 
 - Utilise exclusivement les références présentes dans les preuves.
-- Pour chaque citation, conserve document_id, document_name,
-  document_type, page_number et chunk_id.
+- Retourne les références dans le champ citations et ajoute à la fin
+    de chaque phrase factuelle un marqueur [[cite:<chunk_id>]], en utilisant
+    le chunk_id exact de la preuve qui soutient cette phrase.
+- N'affiche jamais document_id, document_name, page_number ou chunk_id
+    autrement que dans ces marqueurs techniques.
 - N'invente jamais de numéro de page ou de document.
 - Les citations doivent soutenir directement les affirmations.
+- Les marqueurs seront remplacés par des boutons de source dans l'interface.
 
 Ne réponds pas au-delà de ce que les preuves permettent d'établir.
 """
@@ -95,7 +105,16 @@ def generate_answer(
     if not state.get("evidence_sufficient", False):
         raise ValueError("Les preuves ne sont pas suffisantes.")
 
-    pages = state.get("retrieved_pages", [])
+    retrieved_pages = state.get("retrieved_pages", [])
+    supporting_page_keys = {
+        (str(page.get("document_id")), page.get("page_number"))
+        for page in state.get("supporting_pages", [])
+    }
+    pages = [
+        page for page in retrieved_pages
+        if not supporting_page_keys
+        or (str(page.get("document_id")), page.get("page_number")) in supporting_page_keys
+    ]
 
     if not pages:
         raise ValueError("Aucune preuve documentaire disponible.")
@@ -105,6 +124,9 @@ def generate_answer(
             "role": "user",
             "content": (
                 f"Question de l'utilisateur :\n{question}\n\n"
+                f"Évaluation par axe :\n{state.get('axis_assessments', [])}\n\n"
+                f"Limites identifiées :\n{state.get('limitations', [])}\n\n"
+                f"Contradictions détectées :\n{state.get('contradictions', [])}\n\n"
                 f"Preuves documentaires :\n{pages}\n\n"
                 "Rédige une réponse en respectant strictement "
                 "les règles du système."
@@ -124,13 +146,20 @@ def generate_answer(
             "Le LLM doit retourner un objet GeneratedAnswer."
         )
 
-    answer = result.answer.strip()
+    answer = result.answer
 
-    if not answer:
+    if not answer.strip():
         raise ValueError("Le LLM a retourné une réponse vide.")
 
     return {
         "answer": answer,
         "citations": [citation.model_dump() for citation in result.citations],
-        "limitations": result.limitations,
+        "limitations": list(dict.fromkeys([
+            *result.limitations,
+            *state.get("limitations", []),
+            *[
+                f"Contradiction documentaire : {item}"
+                for item in state.get("contradictions", [])
+            ],
+        ])),
     }
