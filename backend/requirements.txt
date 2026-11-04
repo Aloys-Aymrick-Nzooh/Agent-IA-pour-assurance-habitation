@@ -1,9 +1,7 @@
-
+﻿
 fastapi
 uvicorn[standard]
-sqlalchemy
 psycopg[binary]
-pgvector
 pymupdf
 python-multipart
 python-dotenv
@@ -16,3 +14,7 @@ langchain-openai
 langchain-anthropic
 langchain-google-genai
 rank-bm25
+
+
+
+
